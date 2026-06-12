@@ -707,6 +707,53 @@ class MainWindow(QMainWindow):
         self.video_path = path
         self.statusbar.showMessage(f"Selected: {Path(path).name}")
         self._log(f"[file] {path}")
+        
+        # Автоматическое определение параметров видео через ffprobe
+        import subprocess
+        import json
+        import shutil
+        
+        if shutil.which("ffprobe"):
+            try:
+                cmd = [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,r_frame_rate", 
+                    "-of", "json", path
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                if res.returncode == 0:
+                    info = json.loads(res.stdout)
+                    if "streams" in info and len(info["streams"]) > 0:
+                        stream = info["streams"][0]
+                        w = stream.get("width")
+                        h = stream.get("height")
+                        fps_raw = stream.get("r_frame_rate", "24/1")
+                        
+                        if w and h:
+                            # Округляем до ближайшего кратного 16 (рекомендуется для LTX моделей)
+                            w_rounded = max(256, min(1024, round(w / 16) * 16))
+                            h_rounded = max(256, min(1024, round(h / 16) * 16))
+                            
+                            self.width_spin.setValue(w_rounded)
+                            self.height_spin.setValue(h_rounded)
+                            
+                            log_msg = f"[info] Probed resolution: {w}x{h} -> set to {w_rounded}x{h_rounded}"
+                            
+                            # Попробуем прочитать FPS
+                            if "/" in fps_raw:
+                                try:
+                                    num, den = map(int, fps_raw.split("/"))
+                                    if den > 0:
+                                        fps = round(num / den, 2)
+                                        self.fps_spin.setValue(fps)
+                                        log_msg += f", FPS: {fps}"
+                                except Exception:
+                                    pass
+                            
+                            self._log(log_msg)
+                            self.statusbar.showMessage(f"Selected: {Path(path).name} ({w}x{h})")
+            except Exception as e:
+                self._log(f"[system] Failed to probe video: {e}")
 
     def _get_mode(self) -> str:
         idx = self.mode_combo.currentIndex()

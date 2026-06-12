@@ -67,7 +67,7 @@ fi
 
 $PIP install torch torchaudio --index-url $TORCH_IDX -q 2>>"$LOG" && ok "PyTorch installed"
 $PIP install -r requirements.txt -q 2>>"$LOG" && ok "Dependencies installed"
-$PIP install fastapi uvicorn[standard] python-multipart aiofiles huggingface_hub -q 2>>"$LOG"
+$PIP install gradio fastapi uvicorn[standard] python-multipart aiofiles huggingface_hub -q 2>>"$LOG"
 
 # ─── 5. Download models ───────────────────────────────────────────────────────
 log "Downloading models from HuggingFace..."
@@ -115,22 +115,20 @@ fi
 log "Writing server.py..."
 cat > "$REPO_DIR/server.py" << 'PYEOF'
 """
-VHS Restorer — FastAPI server for RunPod
-Endpoints:
-  POST /process          — upload video, returns job_id
-  GET  /status/{job_id}  — returns progress 0-100, status, log tail
-  GET  /download/{job_id}— streams the output MP4
-  GET  /health           — GPU info
+VHS Restorer — Gradio Web UI for RunPod
+Provides an interactive, modern web interface to upload, restore, and download VHS videos.
+Supports auto-resolution detection and segment-based processing for long videos.
 """
 
-import os, uuid, subprocess, threading, time, json, shutil
+import os
+import sys
+import uuid
+import time
+import subprocess
+import json
+import shutil
 from pathlib import Path
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-import torch
-
-app = FastAPI(title="VHS Restorer", version="1.0.0")
+import gradio as gr
 
 REPO = Path(__file__).parent
 INPUTS  = REPO / "inputs"
@@ -138,12 +136,10 @@ OUTPUTS = REPO / "outputs"
 INPUTS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
-jobs: dict[str, dict] = {}   # job_id -> {status, progress, log, pid}
-
 LORA_MAP = {
     "restoration": "models/loras/ltx2.3-train/ltx2.3-video-restoration-general.safetensors",
     "hd":          "models/loras/ltx2.3-train/ltx2.3-ic-video-upscale-general.safetensors",
-    "both":        None,   # pipeline: restoration → hd
+    "both":        None,
 }
 
 PROMPT_MAP = {
@@ -157,230 +153,364 @@ PROMPT_MAP = {
     ),
 }
 
-
-def _run_stage(job_id: str, mode: str, in_path: Path, out_path: Path,
-               height: int, width: int, num_frames: int, fps: float, seed: int):
-    """Run a single pipeline stage in subprocess."""
-    lora = LORA_MAP[mode]
-    prompt = PROMPT_MAP[mode]
-    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-
-    cmd = [
-        "python", "run_pipeline.py",
-        "--mode", mode,
-        "--video", str(in_path),
-        "--prompt", prompt,
-        "--output", str(out_path),
-        "--height", str(height),
-        "--width",  str(width),
-        "--num-frames", str(num_frames),
-        "--fps", str(fps),
-        "--seed", str(seed),
-        "--sigma-profile", "workflow",
-        "--streaming-prefetch-count", "2",
-        "--model-checkpoint",
-        "models/checkpoints/ltx-2.3-edit-insight-dev-fp8.safetensors",
-        "--lora", lora,
-    ]
-
-    proc = subprocess.Popen(
-        cmd, cwd=str(REPO), env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
-    )
-    jobs[job_id]["pid"] = proc.pid
-    log_lines = []
-    for line in proc.stdout:
-        line = line.rstrip()
-        log_lines.append(line)
-        if len(log_lines) > 200:
-            log_lines.pop(0)
-        jobs[job_id]["log"] = log_lines[-50:]
-        # crude progress: look for step indicators
-        if "step" in line.lower() and "/" in line:
-            try:
-                parts = [p for p in line.split() if "/" in p]
-                for p in parts:
-                    a, b = p.split("/")
-                    jobs[job_id]["progress"] = min(99, int(int(a)/int(b)*100))
-                    break
-            except Exception:
-                pass
-    proc.wait()
-    return proc.returncode
-
-
-def _job_worker(job_id: str, in_path: Path, mode: str,
-                height: int, width: int, num_frames: int, fps: float, seed: int):
-    """Background thread: run pipeline, update job state."""
+def probe_video(video_path):
+    if not video_path:
+        return 512, 352, 24.0, "Ready. Upload a video to begin."
     try:
-        jobs[job_id]["status"] = "preprocessing"
-        jobs[job_id]["progress"] = 2
+        import subprocess, json
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "json", video_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            info = json.loads(res.stdout)
+            if "streams" in info and len(info["streams"]) > 0:
+                stream = info["streams"][0]
+                w = stream.get("width")
+                h = stream.get("height")
+                fps_raw = stream.get("r_frame_rate", "24/1")
+                
+                # Round to nearest multiple of 16 (good for LTX models)
+                w_rounded = max(256, min(1024, round(w / 16) * 16))
+                h_rounded = max(256, min(1024, round(h / 16) * 16))
+                
+                fps = 24.0
+                if "/" in fps_raw:
+                    num, den = map(int, fps_raw.split("/"))
+                    if den > 0:
+                        fps = round(num / den, 2)
+                
+                status_text = f"Probed video: {w}x{h} ({fps} FPS). Set target resolution to {w_rounded}x{h_rounded}."
+                return h_rounded, w_rounded, fps, status_text
+    except Exception as e:
+        return 512, 352, 24.0, f"Failed to probe video: {str(e)}"
+    return 512, 352, 24.0, "Ready."
 
-        # Preprocess: scale to 480p, 24fps
-        pre_path = INPUTS / f"{job_id}_480p.mp4"
-        subprocess.run([
+def process_video_web(video_path, mode, height, width, num_frames, fps, seed, auto_split):
+    if not video_path:
+        yield "Error", "Please upload a video file first.", None
+        return
+        
+    job_id = str(uuid.uuid4())[:12]
+    job_dir = OUTPUTS / job_id
+    job_dir.mkdir(exist_ok=True)
+    
+    in_path = Path(video_path)
+    log_lines = []
+    
+    def log_and_yield(status_text, new_log=None):
+        if new_log:
+            log_lines.append(f"[{time.strftime('%H:%M:%S')}] {new_log}")
+        trimmed_logs = "\n".join(log_lines[-100:])
+        return status_text, trimmed_logs
+        
+    yield log_and_yield("Initializing job...", f"Starting job {job_id}")
+    yield log_and_yield("Initializing job...", f"Mode: {mode} | Resolution: {width}x{height} | Frames: {num_frames} | FPS: {fps} | Seed: {seed}")
+    
+    # 1. Get duration
+    duration = 0.0
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(in_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        duration = float(res.stdout.strip())
+        yield log_and_yield("Initializing job...", f"Input video duration: {duration:.2f} seconds")
+    except Exception as e:
+        yield log_and_yield("Initializing job...", f"Warning: failed to get duration: {e}")
+        
+    segment_duration = num_frames / fps
+    should_split = auto_split and duration > (segment_duration * 1.1)
+    chunks_to_process = []
+    
+    if should_split:
+        status = "Splitting video into chunks..."
+        yield log_and_yield(status, f"Video is longer than {segment_duration:.1f}s. Splitting into chunks of ~{segment_duration:.1f}s...")
+        
+        split_cmd = [
+            "ffmpeg", "-y", "-i", str(in_path),
+            "-f", "segment", "-segment_time", str(segment_duration),
+            "-c", "copy", "-reset_timestamps", "1",
+            "-map", "0", str(job_dir / "chunk_%03d.mp4")
+        ]
+        res = subprocess.run(split_cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            yield log_and_yield("Error", f"Failed to split video:\n{res.stderr}"), None
+            return
+            
+        chunks = sorted(job_dir.glob("chunk_*.mp4"))
+        yield log_and_yield("Splitting video into chunks...", f"Successfully split video into {len(chunks)} chunks.")
+        
+        for idx, chunk in enumerate(chunks):
+            # Preprocess chunk: resize & fps change (try GPU nvenc, fallback to CPU)
+            chunk_pre = job_dir / f"pre_{chunk.name}"
+            yield log_and_yield(f"Preprocessing chunk {idx+1}/{len(chunks)}...", f"Preprocessing chunk {idx+1}: {chunk.name}")
+            
+            res_pre = subprocess.run([
+                "ffmpeg", "-y", "-i", str(chunk),
+                "-vf", f"scale={width}:{height}",
+                "-r", str(fps), "-c:v", "h264_nvenc", "-preset", "p4",
+                str(chunk_pre)
+            ], capture_output=True)
+            if res_pre.returncode != 0:
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(chunk),
+                    "-vf", f"scale={width}:{height}",
+                    "-r", str(fps), "-c:v", "libx264", "-crf", "18",
+                    str(chunk_pre)
+                ], capture_output=True)
+                
+            chunks_to_process.append((chunk_pre, job_dir / f"restored_{chunk.name}", idx))
+    else:
+        # Preprocess full video directly
+        pre_path = job_dir / "pre_full.mp4"
+        yield log_and_yield("Preprocessing video...", "Resizing and formatting video...")
+        
+        res_pre = subprocess.run([
             "ffmpeg", "-y", "-i", str(in_path),
             "-vf", f"scale={width}:{height}",
-            "-r", str(fps), "-c:v", "libx264", "-crf", "18",
+            "-r", str(fps), "-c:v", "h264_nvenc", "-preset", "p4",
             str(pre_path)
         ], capture_output=True)
+        if res_pre.returncode != 0:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(in_path),
+                "-vf", f"scale={width}:{height}",
+                "-r", str(fps), "-c:v", "libx264", "-crf", "18",
+                str(pre_path)
+            ], capture_output=True)
+            
+        chunks_to_process.append((pre_path, job_dir / "restored_full.mp4", 0))
 
+    # Helper to run a pipeline stage
+    def run_stage(mode_name, input_file, output_file, cur_height, cur_width, chunk_idx, total_chunks, stage_name):
+        lora = LORA_MAP[mode_name]
+        prompt = PROMPT_MAP[mode_name]
+        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+        
+        cmd = [
+            "python", "run_pipeline.py",
+            "--mode", mode_name,
+            "--video", str(input_file),
+            "--prompt", prompt,
+            "--output", str(output_file),
+            "--height", str(cur_height),
+            "--width",  str(cur_width),
+            "--num-frames", str(num_frames),
+            "--fps", str(fps),
+            "--seed", str(seed),
+            "--sigma-profile", "workflow",
+            "--streaming-prefetch-count", "2",
+            "--model-checkpoint", "models/checkpoints/ltx-2.3-edit-insight-dev-fp8.safetensors",
+            "--lora", lora if lora else "",
+        ]
+        
+        prefix = f"[{stage_name}] "
+        if total_chunks > 1:
+            prefix += f"[Chunk {chunk_idx+1}/{total_chunks}] "
+            
+        proc = subprocess.Popen(
+            cmd, cwd=str(REPO), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log_lines.append(f"{prefix}{line}")
+            if "step" in line.lower() or "loading" in line.lower():
+                yield log_and_yield(f"Processing... {prefix}{line.strip()[:60]}...")
+        proc.wait()
+        return proc.returncode
+
+    total_chunks = len(chunks_to_process)
+    for chunk_in, chunk_out, idx in chunks_to_process:
         if mode == "both":
             # Stage 1: restoration
-            jobs[job_id]["status"] = "restoring"
-            jobs[job_id]["progress"] = 5
-            restored = OUTPUTS / f"{job_id}_stage1.mp4"
-            rc = _run_stage(job_id, "restoration", pre_path, restored,
-                            height, width, num_frames, fps, seed)
+            yield log_and_yield(f"Restoring chunk {idx+1}/{total_chunks}...", f"Starting Restoration for chunk {idx+1}...")
+            temp_restored = job_dir / f"temp_restored_{idx}.mp4"
+            rc = yield from run_stage("restoration", chunk_in, temp_restored, height, width, idx, total_chunks, "RESTORE")
             if rc != 0:
-                raise RuntimeError("Restoration stage failed")
-
+                yield log_and_yield("Error", "Restoration stage failed. Check logs below."), None
+                return
+                
             # Stage 2: HD upscale
-            jobs[job_id]["status"] = "upscaling"
-            jobs[job_id]["progress"] = 55
-            final = OUTPUTS / f"{job_id}_final.mp4"
-            rc = _run_stage(job_id, "hd", restored, final,
-                            height * 2, width * 2, num_frames, fps, seed)
+            yield log_and_yield(f"Upscaling chunk {idx+1}/{total_chunks}...", f"Starting HD Upscale for chunk {idx+1}...")
+            rc = yield from run_stage("hd", temp_restored, chunk_out, height * 2, width * 2, idx, total_chunks, "UPSCALE")
             if rc != 0:
-                raise RuntimeError("HD upscale stage failed")
-            shutil.move(str(final), str(OUTPUTS / f"{job_id}.mp4"))
+                yield log_and_yield("Error", "HD upscale stage failed. Check logs below."), None
+                return
+            temp_restored.unlink(missing_ok=True)
         else:
-            jobs[job_id]["status"] = "processing"
-            jobs[job_id]["progress"] = 5
-            out = OUTPUTS / f"{job_id}.mp4"
-            rc = _run_stage(job_id, mode, pre_path, out,
-                            height, width, num_frames, fps, seed)
+            yield log_and_yield(f"Processing chunk {idx+1}/{total_chunks}...", f"Starting {mode} for chunk {idx+1}...")
+            target_h = height * 2 if mode == "hd" else height
+            target_w = width * 2 if mode == "hd" else width
+            rc = yield from run_stage(mode, chunk_in, chunk_out, target_h, target_w, idx, total_chunks, mode.upper())
             if rc != 0:
-                raise RuntimeError(f"Stage {mode} failed")
+                yield log_and_yield("Error", f"Processing stage {mode} failed. Check logs below."), None
+                return
 
-        jobs[job_id]["status"] = "done"
-        jobs[job_id]["progress"] = 100
+    # 3. Merge chunks if split
+    final_output = job_dir / f"restored_{job_id}.mp4"
+    if should_split:
+        yield log_and_yield("Merging restored chunks...", "Combining restored video segments...")
+        list_file = job_dir / "merge_list.txt"
+        with open(list_file, "w") as f:
+            for _, chunk_out, _ in chunks_to_process:
+                f.write(f"file '{chunk_out.name}'\n")
+                
+        merge_cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_file), "-c", "copy", str(final_output)
+        ]
+        res = subprocess.run(merge_cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            yield log_and_yield("Error", f"Failed to merge chunks:\n{res.stderr}"), None
+            return
+        yield log_and_yield("Merging complete!", "Successfully merged all video chunks.")
+    else:
+        shutil.move(str(chunks_to_process[0][1]), str(final_output))
 
-    except Exception as e:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(e)
-    finally:
-        # Cleanup input
-        try:
-            in_path.unlink()
-            pre_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-# ─── Endpoints ────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-def health():
-    gpu_info = {}
-    try:
-        if torch.cuda.is_available():
-            i = torch.cuda.current_device()
-            gpu_info = {
-                "name": torch.cuda.get_device_name(i),
-                "vram_total_gb": round(torch.cuda.get_device_properties(i).total_memory / 1e9, 1),
-                "vram_free_gb":  round((torch.cuda.get_device_properties(i).total_memory
-                                        - torch.cuda.memory_allocated(i)) / 1e9, 1),
-            }
-    except Exception:
-        pass
-    return {
-        "status": "ok",
-        "gpu": gpu_info,
-        "active_jobs": sum(1 for j in jobs.values() if j["status"] not in ("done", "error")),
-        "models_ready": Path("models/checkpoints/ltx-2.3-edit-insight-dev-fp8.safetensors").exists(),
-    }
+    # Cleanup intermediate files
+    for chunk_in, chunk_out, _ in chunks_to_process:
+        chunk_in.unlink(missing_ok=True)
+        if should_split:
+            chunk_out.unlink(missing_ok=True)
+            
+    yield log_and_yield("Done!", "Video processing complete! Download the result below."), str(final_output)
 
 
-@app.post("/process")
-async def process_video(
-    file: UploadFile = File(...),
-    mode: str = Form("restoration"),   # restoration | hd | both
-    height: int = Form(512),
-    width:  int = Form(352),
-    num_frames: int = Form(97),
-    fps: float = Form(24.0),
-    seed: int = Form(42),
-):
-    if mode not in LORA_MAP:
-        raise HTTPException(400, f"mode must be one of: {list(LORA_MAP)}")
-    if num_frames % 8 != 1:
-        raise HTTPException(400, "num_frames must satisfy 8k+1 (e.g. 25, 97, 217)")
+# ─── Gradio UI Design ─────────────────────────────────────────────────────────
 
-    job_id = str(uuid.uuid4())[:12]
-    in_path = INPUTS / f"{job_id}_raw.mp4"
+theme = gr.themes.Soft(
+    primary_hue="violet",
+    secondary_hue="indigo",
+    neutral_hue="slate",
+).set(
+    body_background_fill="*neutral_950",
+    block_background_fill="*neutral_900",
+    block_border_width="1px",
+    block_border_color="*neutral_800",
+    button_primary_background_fill="*primary_600",
+    button_primary_background_fill_hover="*primary_500",
+)
 
-    with open(in_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+css = """
+.gradio-container {
+    max-width: 1200px !important;
+    margin: 0 auto !important;
+}
+.header-box {
+    text-align: center;
+    padding: 20px 0;
+    margin-bottom: 20px;
+    background: linear-gradient(135deg, rgba(124, 111, 247, 0.1) 0%, rgba(90, 84, 196, 0.05) 100%);
+    border: 1px solid rgba(124, 111, 247, 0.2);
+    border-radius: 12px;
+}
+.header-box h1 {
+    font-size: 28px !important;
+    font-weight: 800 !important;
+    color: #ffffff !important;
+    margin-bottom: 5px !important;
+    background: linear-gradient(90deg, #7c6ff7, #3ecf8e);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.header-box p {
+    color: #9a9ba8 !important;
+    font-size: 14px !important;
+}
+"""
 
-    jobs[job_id] = {
-        "status": "queued", "progress": 0,
-        "log": [], "error": None, "pid": None,
-        "mode": mode, "created": time.time(),
-    }
+with gr.Blocks(theme=theme, css=css) as demo:
+    gr.HTML("""
+    <div class="header-box">
+        <h1>VHS Restorer</h1>
+        <p>AI-powered video restoration and upscaling using LTX2.3-ICEdit-Insight</p>
+    </div>
+    """)
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown("### 🛠 Input & Settings")
+            input_video = gr.Video(label="Upload Video", sources=["upload"])
+            
+            mode = gr.Dropdown(
+                label="Restoration Mode",
+                choices=[
+                    ("VHS Restoration (Artifact removal)", "restoration"),
+                    ("HD Upscale only (x2 Resolution)", "hd"),
+                    ("Both (VHS Restore then HD Upscale)", "both")
+                ],
+                value="both"
+            )
+            
+            with gr.Row():
+                width_spin = gr.Number(label="Target Width", value=352, precision=0)
+                height_spin = gr.Number(label="Target Height", value=512, precision=0)
+                
+            with gr.Row():
+                frames_combo = gr.Dropdown(
+                    label="Frames (8k+1 Chunk Size)",
+                    choices=[("25 (~1s)", 25), ("49 (~2s)", 49), ("97 (~4s)", 97), ("145 (~6s)", 145), ("217 (~9s)", 217)],
+                    value=97
+                )
+                fps_spin = gr.Number(label="FPS", value=24.0)
+                
+            with gr.Row():
+                seed_spin = gr.Number(label="Seed", value=42, precision=0)
+                random_seed = gr.Checkbox(label="Randomize Seed", value=False)
+                
+            auto_split = gr.Checkbox(label="Auto-split long videos (4s chunks)", value=True)
+            
+            btn_start = gr.Button("▶ Start Processing", variant="primary")
+            btn_cancel = gr.Button("🛑 Cancel Job", variant="secondary")
+            
+        with gr.Column(scale=1):
+            gr.Markdown("### 📊 Status & Output")
+            status_text = gr.Textbox(label="Current Status", value="Ready. Upload a video to begin.", interactive=False)
+            
+            output_video = gr.Video(label="Restored Video Output", interactive=False)
+            
+            log_output = gr.Textbox(
+                label="Server Live Logs",
+                value="",
+                lines=15,
+                max_lines=20,
+                interactive=False
+            )
 
-    t = threading.Thread(
-        target=_job_worker,
-        args=(job_id, in_path, mode, height, width, num_frames, fps, seed),
-        daemon=True
+    # Event handlers
+    # Probe video on change
+    input_video.change(
+        fn=probe_video,
+        inputs=[input_video],
+        outputs=[height_spin, width_spin, fps_spin, status_text]
     )
-    t.start()
-    return {"job_id": job_id, "status": "queued"}
-
-
-@app.get("/status/{job_id}")
-def get_status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
-    j = jobs[job_id]
-    return {
-        "job_id": job_id,
-        "status": j["status"],
-        "progress": j["progress"],
-        "log": j["log"],
-        "error": j.get("error"),
-        "mode": j.get("mode"),
-        "elapsed": round(time.time() - j["created"], 1),
-    }
-
-
-@app.get("/download/{job_id}")
-def download_result(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
-    if jobs[job_id]["status"] != "done":
-        raise HTTPException(400, f"Job not done yet: {jobs[job_id]['status']}")
-
-    out_path = OUTPUTS / f"{job_id}.mp4"
-    if not out_path.exists():
-        raise HTTPException(404, "Output file not found")
-
-    def iter_file():
-        with open(out_path, "rb") as f:
-            while chunk := f.read(1024 * 1024):
-                yield chunk
-
-    return StreamingResponse(
-        iter_file(),
-        media_type="video/mp4",
-        headers={"Content-Disposition": f"attachment; filename=restored_{job_id}.mp4"}
+    
+    # Run processing
+    def adjust_seed_and_run(video, mode_val, h, w, frames, fps_val, seed_val, rand_seed, split_val):
+        s = seed_val
+        if rand_seed:
+            import random
+            s = random.randint(0, 99999)
+        yield from process_video_web(video, mode_val, int(h), int(w), int(frames), float(fps_val), int(s), split_val)
+        
+    click_event = btn_start.click(
+        fn=adjust_seed_and_run,
+        inputs=[input_video, mode, height_spin, width_spin, frames_combo, fps_spin, seed_spin, random_seed, auto_split],
+        outputs=[status_text, log_output, output_video]
     )
-
-
-@app.delete("/job/{job_id}")
-def delete_job(job_id: str):
-    if job_id in jobs:
-        out = OUTPUTS / f"{job_id}.mp4"
-        out.unlink(missing_ok=True)
-        del jobs[job_id]
-    return {"deleted": job_id}
-
+    
+    btn_cancel.click(fn=None, inputs=None, outputs=None, cancels=[click_event])
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
+    demo.queue().launch(server_name="0.0.0.0", server_port=8000, share=False)
 PYEOF
 
 ok "server.py written"
@@ -390,6 +520,7 @@ log "Starting FastAPI server on port $PORT..."
 cd "$REPO_DIR"
 
 # Kill existing server if running
+pkill -f "python server.py" 2>/dev/null || true
 pkill -f "uvicorn server:app" 2>/dev/null || true
 sleep 1
 
@@ -400,9 +531,9 @@ echo $SERVER_PID > "$WORKSPACE/server.pid"
 # Wait for server to come up
 for i in $(seq 1 30); do
     sleep 2
-    if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
+    if curl -sf "http://localhost:$PORT/" > /dev/null 2>&1; then
         ok "Server is UP! PID=$SERVER_PID  Port=$PORT"
-        log "Health: $(curl -s http://localhost:$PORT/health)"
+        log "Gradio Web UI is active and ready."
         echo ""
         echo "=========================================="
         echo " Server ready at: http://localhost:$PORT"
