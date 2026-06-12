@@ -60,6 +60,10 @@ python vhs_restorer_client.py
 ### 3. Usage
 1. Paste your RunPod URL → **Connect**
 2. Drop your VHS video into the drop zone
+   - Supported containers include MP4, MKV, MOV, AVI, WebM, M4V, WMV,
+     MPEG, MTS/M2TS, TS, VOB, FLV, 3GP, and OGV.
+   - Browser uploads default to a 50 GB limit. Override it on RunPod with
+     `MAX_UPLOAD_SIZE` (for example, `MAX_UPLOAD_SIZE=100gb`).
 3. Choose mode:
    - `restoration` — removes VHS artifacts, noise, tracking errors
    - `hd` — HD upscale only
@@ -95,4 +99,3 @@ ffmpeg -i long_vhs.mp4 -c copy -f segment -segment_time 4 \
 ffmpeg -f concat -safe 0 -i <(for f in restored_*.mp4; do echo "file '$f'"; done) \
   -c copy final_restored.mp4
 ```
-

@@ -12,6 +12,7 @@ VHS Restorer Client — PyQt6
 import sys
 import os
 import json
+import mimetypes
 import time
 import threading
 import requests
@@ -236,9 +237,13 @@ class UploadWorker(QThread):
             with open(self.video_path, "rb") as f:
                 r = requests.post(
                     f"{self.base_url}/process",
-                    files={"file": (Path(self.video_path).name, f, "video/mp4")},
+                    files={"file": (
+                        Path(self.video_path).name,
+                        f,
+                        mimetypes.guess_type(self.video_path)[0] or "application/octet-stream",
+                    )},
                     data=self.params,
-                    timeout=120,
+                    timeout=(30, None),
                 )
             r.raise_for_status()
             self.job_started.emit(r.json()["job_id"])
@@ -345,7 +350,7 @@ class DropZone(QFrame):
     def mousePressEvent(self, event):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select VHS video", "",
-            "Video files (*.mp4 *.avi *.mov *.mkv *.wmv *.mpg *.mpeg);;All files (*)"
+            "Video files (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.wmv *.mpg *.mpeg *.mts *.m2ts *.ts *.vob *.flv *.3gp *.ogv);;All files (*)"
         )
         if path:
             self._set_file(path)
@@ -363,7 +368,11 @@ class DropZone(QFrame):
         urls = event.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
-            if Path(path).suffix.lower() in [".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"]:
+            if Path(path).suffix.lower() in {
+                ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv",
+                ".mpg", ".mpeg", ".mts", ".m2ts", ".ts", ".vob", ".flv",
+                ".3gp", ".ogv",
+            }:
                 self._set_file(path)
 
     def _set_file(self, path: str):

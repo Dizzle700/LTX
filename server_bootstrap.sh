@@ -67,9 +67,13 @@ else
     log "Using CUDA 12.4 wheels"
 fi
 
-"$PIP" install torch torchaudio --index-url "$TORCH_IDX" -q 2>>"$LOG" && ok "PyTorch installed"
+"$PIP" install --force-reinstall torch torchvision torchaudio --index-url "$TORCH_IDX" -q 2>>"$LOG" && ok "PyTorch stack installed"
 "$PIP" install -r requirements.txt -q 2>>"$LOG" && ok "Dependencies installed"
+"$PIP" install --force-reinstall torch torchvision torchaudio --index-url "$TORCH_IDX" -q 2>>"$LOG" && ok "PyTorch stack aligned after requirements"
 "$PIP" install gradio fastapi 'uvicorn[standard]' python-multipart aiofiles huggingface_hub -q 2>>"$LOG" && ok "Web dependencies installed"
+"$PYTHON" -c "import torch, torchvision; print(f'torch={torch.__version__} torchvision={torchvision.__version__} cuda={torch.version.cuda}')" >>"$LOG" 2>&1 \
+    && ok "PyTorch/torchvision import check passed" \
+    || fail "PyTorch/torchvision import check failed; check $LOG"
 
 # ─── 5. Download models ───────────────────────────────────────────────────────
 log "Downloading models from HuggingFace..."
@@ -78,6 +82,7 @@ mkdir -p models/checkpoints models/loras/ltx2.3-train \
          inputs outputs
 
 HF_REPO="joyfox/LTX2.3-ICEdit-Insight"
+GEMMA_REPO="${GEMMA_REPO:-google/gemma-3-12b-it}"
 
 download_model() {
     local filename="$1"
@@ -108,6 +113,42 @@ download_model "ltx-2.3-edit-insight-dev-fp8.safetensors" "models/checkpoints" r
 download_model "ltx2.3-video-restoration-general.safetensors" "models/loras/ltx2.3-train" required
 download_model "ltx2.3-ic-video-upscale-general.safetensors" "models/loras/ltx2.3-train" required
 
+# The Insight checkpoint does not contain the Gemma text encoder. run_pipeline.py
+# needs both its tokenizer/config files and model shards under this directory.
+if [ -f "models/gemma_configs/tokenizer.model" ] && \
+   compgen -G "models/gemma_configs/model*.safetensors" > /dev/null; then
+    warn "Gemma text encoder already exists"
+else
+    log "Downloading Gemma text encoder from $GEMMA_REPO (~25 GB)..."
+    "$PYTHON" -c "
+from huggingface_hub import snapshot_download
+import os
+
+snapshot_download(
+    repo_id='$GEMMA_REPO',
+    local_dir='models/gemma_configs',
+    token=os.getenv('HF_TOKEN'),
+    allow_patterns=[
+        'config.json',
+        'tokenizer.model',
+        'tokenizer_config.json',
+        'special_tokens_map.json',
+        'added_tokens.json',
+        'model*.safetensors',
+    ],
+)
+" 2>>"$LOG" && ok "Gemma text encoder downloaded" || \
+        fail "Failed to download $GEMMA_REPO. Set HF_TOKEN and accept the Gemma license at https://huggingface.co/$GEMMA_REPO, then restart the pod."
+fi
+
+if [ ! -f "models/gemma_configs/tokenizer.model" ]; then
+    fail "Gemma download is incomplete: models/gemma_configs/tokenizer.model is missing"
+fi
+if ! compgen -G "models/gemma_configs/model*.safetensors" > /dev/null; then
+    fail "Gemma download is incomplete: no model*.safetensors files were found"
+fi
+ok "Gemma text encoder files verified"
+
 # Spatial upscaler from Lightricks
 if [ ! -f "models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors" ]; then
     log "Downloading spatial upscaler..."
@@ -132,6 +173,7 @@ Supports auto-resolution detection and segment-based processing for long videos.
 
 import os
 import sys
+import inspect
 import uuid
 import time
 import subprocess
@@ -144,6 +186,12 @@ REPO = Path(__file__).parent
 INPUTS  = REPO / "inputs"
 OUTPUTS = REPO / "outputs"
 PORT = int(os.getenv("PORT", "8000"))
+MAX_UPLOAD_SIZE = os.getenv("MAX_UPLOAD_SIZE", "50gb")
+VIDEO_EXTENSIONS = [
+    ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv",
+    ".mpg", ".mpeg", ".mts", ".m2ts", ".ts", ".vob", ".flv",
+    ".3gp", ".ogv",
+]
 INPUTS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
@@ -164,7 +212,19 @@ PROMPT_MAP = {
     ),
 }
 
+def uploaded_path(value):
+    """Return a filesystem path from Gradio's filepath/FileData variants."""
+    if not value:
+        return None
+    if isinstance(value, (str, os.PathLike)):
+        return str(value)
+    if isinstance(value, dict):
+        return value.get("path") or value.get("name")
+    return getattr(value, "path", None) or getattr(value, "name", None)
+
+
 def probe_video(video_path):
+    video_path = uploaded_path(video_path)
     if not video_path:
         return 512, 352, 24.0, "Ready. Upload a video to begin."
     try:
@@ -174,7 +234,7 @@ def probe_video(video_path):
             "-show_entries", "stream=width,height,r_frame_rate",
             "-of", "json", video_path
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if res.returncode == 0:
             info = json.loads(res.stdout)
             if "streams" in info and len(info["streams"]) > 0:
@@ -200,6 +260,7 @@ def probe_video(video_path):
     return 512, 352, 24.0, "Ready."
 
 def process_video_web(video_path, mode, height, width, num_frames, fps, seed, auto_split):
+    video_path = uploaded_path(video_path)
     if not video_path:
         yield "Error", "Please upload a video file first.", None
         return
@@ -231,7 +292,7 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", str(in_path)
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         duration = float(res.stdout.strip())
         yield emit("Initializing job...", f"Input video duration: {duration:.2f} seconds")
     except Exception as e:
@@ -241,7 +302,7 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
     should_split = auto_split and duration > (segment_duration * 1.1)
     chunks_to_process = []
 
-    def preprocess_video(source_path, output_path, label):
+    def preprocess_video(source_path, output_path, label, keyframe_interval=None):
         yield emit(label, f"Resizing and formatting {source_path.name}...")
 
         base_cmd = [
@@ -249,8 +310,15 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
             "-vf", f"scale={width}:{height}",
             "-r", str(fps),
         ]
-        nvenc_cmd = base_cmd + ["-c:v", "h264_nvenc", "-preset", "p4", "-an", str(output_path)]
-        cpu_cmd = base_cmd + ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-an", str(output_path)]
+        keyframe_args = []
+        if keyframe_interval:
+            keyframe_args = [
+                "-force_key_frames", f"expr:gte(t,n_forced*{keyframe_interval:.6f})",
+                "-g", str(max(1, int(round(fps * keyframe_interval)))),
+                "-keyint_min", str(max(1, int(round(fps * keyframe_interval)))),
+            ]
+        nvenc_cmd = base_cmd + keyframe_args + ["-c:v", "h264_nvenc", "-preset", "p4", "-an", str(output_path)]
+        cpu_cmd = base_cmd + keyframe_args + ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-an", str(output_path)]
 
         res_pre = subprocess.run(nvenc_cmd, capture_output=True, text=True)
         if res_pre.returncode != 0:
@@ -267,7 +335,8 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
         ok_preprocess = yield from preprocess_video(
             in_path,
             normalized_path,
-            "Preprocessing video before split..."
+            "Preprocessing video before split...",
+            segment_duration
         )
         if not ok_preprocess:
             return
@@ -455,7 +524,11 @@ with gr.Blocks(theme=theme, css=css) as demo:
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### 🛠 Input & Settings")
-            input_video = gr.Video(label="Upload Video", sources=["upload"])
+            input_video = gr.File(
+                label=f"Upload Video (up to {MAX_UPLOAD_SIZE})",
+                file_types=VIDEO_EXTENSIONS,
+                type="filepath",
+            )
             
             mode = gr.Dropdown(
                 label="Restoration Mode",
@@ -527,7 +600,14 @@ with gr.Blocks(theme=theme, css=css) as demo:
     btn_cancel.click(fn=None, inputs=None, outputs=None, cancels=[click_event])
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=PORT, share=False)
+    launch_kwargs = {
+        "server_name": "0.0.0.0",
+        "server_port": PORT,
+        "share": False,
+    }
+    if "max_file_size" in inspect.signature(demo.launch).parameters:
+        launch_kwargs["max_file_size"] = MAX_UPLOAD_SIZE
+    demo.queue().launch(**launch_kwargs)
 PYEOF
 
 ok "server.py written"
@@ -548,7 +628,7 @@ pkill -f "python[0-9.]* server.py" 2>/dev/null || true
 pkill -f "uvicorn server:app" 2>/dev/null || true
 sleep 1
 
-PORT="$PORT" nohup "$PYTHON" server.py > "$WORKSPACE/server.log" 2>&1 &
+MAX_UPLOAD_SIZE="${MAX_UPLOAD_SIZE:-50gb}" PORT="$PORT" nohup "$PYTHON" server.py > "$WORKSPACE/server.log" 2>&1 &
 SERVER_PID=$!
 echo $SERVER_PID > "$WORKSPACE/server.pid"
 
