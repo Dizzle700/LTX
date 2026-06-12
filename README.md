@@ -7,7 +7,14 @@
 - Template: `RunPod PyTorch 2.x`  (Ubuntu 22.04, CUDA 12.x)
 - Expose HTTP port: **8000**
 
-### 2. Set Container Start Command
+### 2. Configure Hugging Face access
+1. Accept the license for [`google/gemma-3-12b-it`](https://huggingface.co/google/gemma-3-12b-it).
+2. Create a Hugging Face access token with **Read** permission.
+3. Add it to the RunPod pod environment as `HF_TOKEN`.
+
+The bootstrap validates this token before downloading the gated Gemma model.
+
+### 3. Set Container Start Command
 Paste this into "Container Start Command":
 ```bash
 bash <(curl -sL YOUR_GIST_RAW_URL/server_bootstrap.sh)
@@ -15,7 +22,7 @@ bash <(curl -sL YOUR_GIST_RAW_URL/server_bootstrap.sh)
 > [!NOTE]
 > Replace `YOUR_GIST_RAW_URL` with your raw Gist URL (e.g., `https://gist.githubusercontent.com/username/gist_id/raw/`).
 
-### 3. Watch the logs
+### 4. Watch the logs
 The pod logs will show download progress (~20 GB models).
 Server is ready when you see: `Server is UP!`
 
@@ -24,7 +31,7 @@ Server is ready when you see: `Server is UP!`
 > - Installation logs: `/workspace/bootstrap.log`
 > - FastAPI server logs: `/workspace/server.log`
 
-### 4. Get your URL
+### 5. Get your URL
 In RunPod pod settings → Connect → copy the proxy URL for port 8000:
 ```
 https://xxxxxxxxxxxxxxxx-8000.proxy.runpod.net

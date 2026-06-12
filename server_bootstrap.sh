@@ -83,6 +83,27 @@ mkdir -p models/checkpoints models/loras/ltx2.3-train \
 
 HF_REPO="joyfox/LTX2.3-ICEdit-Insight"
 GEMMA_REPO="${GEMMA_REPO:-google/gemma-3-12b-it}"
+export GEMMA_REPO
+
+gemma_files_ready() {
+    [ -f "models/gemma_configs/tokenizer.model" ] && \
+        compgen -G "models/gemma_configs/model*.safetensors" > /dev/null
+}
+
+if ! gemma_files_ready; then
+    if [ -z "${HF_TOKEN:-}" ]; then
+        fail "HF_TOKEN is required to download $GEMMA_REPO. Create a Hugging Face read token, accept the model license at https://huggingface.co/$GEMMA_REPO, add HF_TOKEN to the RunPod environment, and restart the pod."
+    fi
+
+    log "Validating Hugging Face access to $GEMMA_REPO..."
+    "$PYTHON" -c "
+from huggingface_hub import HfApi
+import os
+
+HfApi(token=os.environ['HF_TOKEN']).model_info(os.environ['GEMMA_REPO'])
+" 2>>"$LOG" && ok "Hugging Face token can access $GEMMA_REPO" || \
+        fail "HF_TOKEN cannot access $GEMMA_REPO. Verify the token has read permission and accept the Gemma license at https://huggingface.co/$GEMMA_REPO."
+fi
 
 download_model() {
     local filename="$1"
@@ -115,8 +136,7 @@ download_model "ltx2.3-ic-video-upscale-general.safetensors" "models/loras/ltx2.
 
 # The Insight checkpoint does not contain the Gemma text encoder. run_pipeline.py
 # needs both its tokenizer/config files and model shards under this directory.
-if [ -f "models/gemma_configs/tokenizer.model" ] && \
-   compgen -G "models/gemma_configs/model*.safetensors" > /dev/null; then
+if gemma_files_ready; then
     warn "Gemma text encoder already exists"
 else
     log "Downloading Gemma text encoder from $GEMMA_REPO (~25 GB)..."
