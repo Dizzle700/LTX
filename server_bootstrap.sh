@@ -406,9 +406,8 @@ for i in $(seq 1 30); do
         echo ""
         echo "=========================================="
         echo " Server ready at: http://localhost:$PORT"
-        echo " Logs: tail -f $WORKSPACE/server.log"
-        echo "=========================================="
-        exit 0
+        # Keep container alive and stream server logs to RunPod stdout
+        tail -f "$WORKSPACE/server.log"
     fi
     log "Waiting for server... ($i/30)"
 done
