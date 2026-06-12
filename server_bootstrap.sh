@@ -36,7 +36,9 @@ if ! command -v conda &>/dev/null; then
     PIP="pip3"
 else
     conda create -n ltx2 python=3.12 -y 2>>"$LOG" || true
-    source activate ltx2 2>/dev/null || conda activate ltx2 2>/dev/null || true
+    CONDA_BASE="$(conda info --base 2>/dev/null)" || fail "Could not locate conda base"
+    source "$CONDA_BASE/etc/profile.d/conda.sh" 2>>"$LOG" || fail "Could not initialize conda"
+    conda activate ltx2 2>>"$LOG" || fail "Could not activate conda env: ltx2"
     PYTHON="python"
     PIP="pip"
 fi
@@ -57,7 +59,7 @@ CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' | head -1 ||
 CUDA_MAJOR=$(echo $CUDA_VER | cut -d. -f1)
 CUDA_MINOR=$(echo $CUDA_VER | cut -d. -f2)
 
-if [ "$CUDA_MAJOR" -ge 12 ] && [ "$CUDA_MINOR" -ge 8 ]; then
+if [ "$CUDA_MAJOR" -gt 12 ] || { [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 8 ]; }; then
     TORCH_IDX="https://download.pytorch.org/whl/cu128"
     log "Using CUDA 12.8 wheels"
 else
@@ -65,9 +67,9 @@ else
     log "Using CUDA 12.4 wheels"
 fi
 
-$PIP install torch torchaudio --index-url $TORCH_IDX -q 2>>"$LOG" && ok "PyTorch installed"
-$PIP install -r requirements.txt -q 2>>"$LOG" && ok "Dependencies installed"
-$PIP install gradio fastapi uvicorn[standard] python-multipart aiofiles huggingface_hub -q 2>>"$LOG"
+"$PIP" install torch torchaudio --index-url "$TORCH_IDX" -q 2>>"$LOG" && ok "PyTorch installed"
+"$PIP" install -r requirements.txt -q 2>>"$LOG" && ok "Dependencies installed"
+"$PIP" install gradio fastapi 'uvicorn[standard]' python-multipart aiofiles huggingface_hub -q 2>>"$LOG" && ok "Web dependencies installed"
 
 # ─── 5. Download models ───────────────────────────────────────────────────────
 log "Downloading models from HuggingFace..."
@@ -80,34 +82,42 @@ HF_REPO="joyfox/LTX2.3-ICEdit-Insight"
 download_model() {
     local filename="$1"
     local dest="$2"
+    local required="${3:-required}"
     if [ -f "$dest/$filename" ]; then
         warn "Already exists: $filename"
         return 0
     fi
     log "Downloading $filename (~$(du -sh $dest/$filename 2>/dev/null | cut -f1 || echo '?'))..."
-    $PYTHON -c "
+    "$PYTHON" -c "
 from huggingface_hub import hf_hub_download
-import shutil, os
-path = hf_hub_download('$HF_REPO', '$filename', cache_dir='/tmp/hf_cache')
+import os
 os.makedirs('$dest', exist_ok=True)
-shutil.copy2(path, '$dest/$filename')
-print('  -> $dest/$filename')
-" 2>>"$LOG" && ok "$filename downloaded" || warn "Failed: $filename"
+token = os.getenv('HF_TOKEN')
+path = hf_hub_download('$HF_REPO', '$filename', local_dir='$dest', local_dir_use_symlinks=False, token=token)
+print('  -> ' + path)
+" 2>>"$LOG" && ok "$filename downloaded" || {
+        if [ "$required" = "required" ]; then
+            fail "Failed to download required model: $filename"
+        else
+            warn "Failed: $filename"
+        fi
+    }
 }
 
-download_model "ltx-2.3-edit-insight-dev-fp8.safetensors" "models/checkpoints"
-download_model "ltx2.3-video-restoration-general.safetensors" "models/loras/ltx2.3-train"
-download_model "ltx2.3-ic-video-upscale-general.safetensors" "models/loras/ltx2.3-train"
+download_model "ltx-2.3-edit-insight-dev-fp8.safetensors" "models/checkpoints" required
+download_model "ltx2.3-video-restoration-general.safetensors" "models/loras/ltx2.3-train" required
+download_model "ltx2.3-ic-video-upscale-general.safetensors" "models/loras/ltx2.3-train" required
 
 # Spatial upscaler from Lightricks
 if [ ! -f "models/latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.1.safetensors" ]; then
     log "Downloading spatial upscaler..."
-    $PYTHON -c "
+    "$PYTHON" -c "
 from huggingface_hub import hf_hub_download
-import shutil, os
+import os
+os.makedirs('models/latent_upscale_models', exist_ok=True)
+token = os.getenv('HF_TOKEN')
 path = hf_hub_download('Lightricks/LTX-2.3',
-    'ltx-2.3-spatial-upscaler-x2-1.1.safetensors', cache_dir='/tmp/hf_cache')
-shutil.copy2(path, 'models/latent_upscale_models/')
+    'ltx-2.3-spatial-upscaler-x2-1.1.safetensors', local_dir='models/latent_upscale_models', local_dir_use_symlinks=False, token=token)
 " 2>>"$LOG" && ok "Upscaler downloaded" || warn "Upscaler download failed (optional)"
 fi
 
@@ -133,6 +143,7 @@ import gradio as gr
 REPO = Path(__file__).parent
 INPUTS  = REPO / "inputs"
 OUTPUTS = REPO / "outputs"
+PORT = int(os.getenv("PORT", "8000"))
 INPUTS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
@@ -205,9 +216,13 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
             log_lines.append(f"[{time.strftime('%H:%M:%S')}] {new_log}")
         trimmed_logs = "\n".join(log_lines[-100:])
         return status_text, trimmed_logs
+
+    def emit(status_text, new_log=None, video=None):
+        status, logs = log_and_yield(status_text, new_log)
+        return status, logs, video
         
-    yield log_and_yield("Initializing job...", f"Starting job {job_id}")
-    yield log_and_yield("Initializing job...", f"Mode: {mode} | Resolution: {width}x{height} | Frames: {num_frames} | FPS: {fps} | Seed: {seed}")
+    yield emit("Initializing job...", f"Starting job {job_id}")
+    yield emit("Initializing job...", f"Mode: {mode} | Resolution: {width}x{height} | Frames: {num_frames} | FPS: {fps} | Seed: {seed}")
     
     # 1. Get duration
     duration = 0.0
@@ -218,70 +233,72 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         duration = float(res.stdout.strip())
-        yield log_and_yield("Initializing job...", f"Input video duration: {duration:.2f} seconds")
+        yield emit("Initializing job...", f"Input video duration: {duration:.2f} seconds")
     except Exception as e:
-        yield log_and_yield("Initializing job...", f"Warning: failed to get duration: {e}")
+        yield emit("Initializing job...", f"Warning: failed to get duration: {e}")
         
     segment_duration = num_frames / fps
     should_split = auto_split and duration > (segment_duration * 1.1)
     chunks_to_process = []
+
+    def preprocess_video(source_path, output_path, label):
+        yield emit(label, f"Resizing and formatting {source_path.name}...")
+
+        base_cmd = [
+            "ffmpeg", "-y", "-i", str(source_path),
+            "-vf", f"scale={width}:{height}",
+            "-r", str(fps),
+        ]
+        nvenc_cmd = base_cmd + ["-c:v", "h264_nvenc", "-preset", "p4", "-an", str(output_path)]
+        cpu_cmd = base_cmd + ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-an", str(output_path)]
+
+        res_pre = subprocess.run(nvenc_cmd, capture_output=True, text=True)
+        if res_pre.returncode != 0:
+            log_lines.append("NVENC preprocessing failed; retrying with libx264.")
+            res_pre = subprocess.run(cpu_cmd, capture_output=True, text=True)
+
+        if res_pre.returncode != 0 or not output_path.exists():
+            yield emit("Error", f"Failed to preprocess {source_path.name}:\n{res_pre.stderr}")
+            return False
+        return True
     
     if should_split:
-        status = "Splitting video into chunks..."
-        yield log_and_yield(status, f"Video is longer than {segment_duration:.1f}s. Splitting into chunks of ~{segment_duration:.1f}s...")
+        normalized_path = job_dir / "normalized_full.mp4"
+        ok_preprocess = yield from preprocess_video(
+            in_path,
+            normalized_path,
+            "Preprocessing video before split..."
+        )
+        if not ok_preprocess:
+            return
+
+        yield emit("Splitting video into chunks...", f"Video is longer than {segment_duration:.1f}s. Splitting normalized input into ~{segment_duration:.1f}s chunks...")
         
         split_cmd = [
-            "ffmpeg", "-y", "-i", str(in_path),
+            "ffmpeg", "-y", "-i", str(normalized_path),
             "-f", "segment", "-segment_time", str(segment_duration),
             "-c", "copy", "-reset_timestamps", "1",
-            "-map", "0", str(job_dir / "chunk_%03d.mp4")
+            "-map", "0:v:0", str(job_dir / "chunk_%03d.mp4")
         ]
         res = subprocess.run(split_cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            yield log_and_yield("Error", f"Failed to split video:\n{res.stderr}"), None
+            yield emit("Error", f"Failed to split video:\n{res.stderr}")
             return
             
         chunks = sorted(job_dir.glob("chunk_*.mp4"))
-        yield log_and_yield("Splitting video into chunks...", f"Successfully split video into {len(chunks)} chunks.")
+        if not chunks:
+            yield emit("Error", "Failed to split video: ffmpeg produced no chunks.")
+            return
+        yield emit("Splitting video into chunks...", f"Successfully split video into {len(chunks)} chunks.")
         
         for idx, chunk in enumerate(chunks):
-            # Preprocess chunk: resize & fps change (try GPU nvenc, fallback to CPU)
-            chunk_pre = job_dir / f"pre_{chunk.name}"
-            yield log_and_yield(f"Preprocessing chunk {idx+1}/{len(chunks)}...", f"Preprocessing chunk {idx+1}: {chunk.name}")
-            
-            res_pre = subprocess.run([
-                "ffmpeg", "-y", "-i", str(chunk),
-                "-vf", f"scale={width}:{height}",
-                "-r", str(fps), "-c:v", "h264_nvenc", "-preset", "p4",
-                str(chunk_pre)
-            ], capture_output=True)
-            if res_pre.returncode != 0:
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", str(chunk),
-                    "-vf", f"scale={width}:{height}",
-                    "-r", str(fps), "-c:v", "libx264", "-crf", "18",
-                    str(chunk_pre)
-                ], capture_output=True)
-                
-            chunks_to_process.append((chunk_pre, job_dir / f"restored_{chunk.name}", idx))
+            chunks_to_process.append((chunk, job_dir / f"restored_{chunk.name}", idx))
     else:
         # Preprocess full video directly
         pre_path = job_dir / "pre_full.mp4"
-        yield log_and_yield("Preprocessing video...", "Resizing and formatting video...")
-        
-        res_pre = subprocess.run([
-            "ffmpeg", "-y", "-i", str(in_path),
-            "-vf", f"scale={width}:{height}",
-            "-r", str(fps), "-c:v", "h264_nvenc", "-preset", "p4",
-            str(pre_path)
-        ], capture_output=True)
-        if res_pre.returncode != 0:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", str(in_path),
-                "-vf", f"scale={width}:{height}",
-                "-r", str(fps), "-c:v", "libx264", "-crf", "18",
-                str(pre_path)
-            ], capture_output=True)
+        ok_preprocess = yield from preprocess_video(in_path, pre_path, "Preprocessing video...")
+        if not ok_preprocess:
+            return
             
         chunks_to_process.append((pre_path, job_dir / "restored_full.mp4", 0))
 
@@ -292,7 +309,7 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
         env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
         
         cmd = [
-            "python", "run_pipeline.py",
+            sys.executable, "run_pipeline.py",
             "--mode", mode_name,
             "--video", str(input_file),
             "--prompt", prompt,
@@ -323,7 +340,7 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
             if line:
                 log_lines.append(f"{prefix}{line}")
             if "step" in line.lower() or "loading" in line.lower():
-                yield log_and_yield(f"Processing... {prefix}{line.strip()[:60]}...")
+                yield emit(f"Processing... {prefix}{line.strip()[:60]}...")
         proc.wait()
         return proc.returncode
 
@@ -331,33 +348,33 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
     for chunk_in, chunk_out, idx in chunks_to_process:
         if mode == "both":
             # Stage 1: restoration
-            yield log_and_yield(f"Restoring chunk {idx+1}/{total_chunks}...", f"Starting Restoration for chunk {idx+1}...")
+            yield emit(f"Restoring chunk {idx+1}/{total_chunks}...", f"Starting Restoration for chunk {idx+1}...")
             temp_restored = job_dir / f"temp_restored_{idx}.mp4"
             rc = yield from run_stage("restoration", chunk_in, temp_restored, height, width, idx, total_chunks, "RESTORE")
             if rc != 0:
-                yield log_and_yield("Error", "Restoration stage failed. Check logs below."), None
+                yield emit("Error", "Restoration stage failed. Check logs below.")
                 return
                 
             # Stage 2: HD upscale
-            yield log_and_yield(f"Upscaling chunk {idx+1}/{total_chunks}...", f"Starting HD Upscale for chunk {idx+1}...")
+            yield emit(f"Upscaling chunk {idx+1}/{total_chunks}...", f"Starting HD Upscale for chunk {idx+1}...")
             rc = yield from run_stage("hd", temp_restored, chunk_out, height * 2, width * 2, idx, total_chunks, "UPSCALE")
             if rc != 0:
-                yield log_and_yield("Error", "HD upscale stage failed. Check logs below."), None
+                yield emit("Error", "HD upscale stage failed. Check logs below.")
                 return
             temp_restored.unlink(missing_ok=True)
         else:
-            yield log_and_yield(f"Processing chunk {idx+1}/{total_chunks}...", f"Starting {mode} for chunk {idx+1}...")
+            yield emit(f"Processing chunk {idx+1}/{total_chunks}...", f"Starting {mode} for chunk {idx+1}...")
             target_h = height * 2 if mode == "hd" else height
             target_w = width * 2 if mode == "hd" else width
             rc = yield from run_stage(mode, chunk_in, chunk_out, target_h, target_w, idx, total_chunks, mode.upper())
             if rc != 0:
-                yield log_and_yield("Error", f"Processing stage {mode} failed. Check logs below."), None
+                yield emit("Error", f"Processing stage {mode} failed. Check logs below.")
                 return
 
     # 3. Merge chunks if split
     final_output = job_dir / f"restored_{job_id}.mp4"
     if should_split:
-        yield log_and_yield("Merging restored chunks...", "Combining restored video segments...")
+        yield emit("Merging restored chunks...", "Combining restored video segments...")
         list_file = job_dir / "merge_list.txt"
         with open(list_file, "w") as f:
             for _, chunk_out, _ in chunks_to_process:
@@ -369,9 +386,9 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
         ]
         res = subprocess.run(merge_cmd, capture_output=True, text=True)
         if res.returncode != 0:
-            yield log_and_yield("Error", f"Failed to merge chunks:\n{res.stderr}"), None
+            yield emit("Error", f"Failed to merge chunks:\n{res.stderr}")
             return
-        yield log_and_yield("Merging complete!", "Successfully merged all video chunks.")
+        yield emit("Merging complete!", "Successfully merged all video chunks.")
     else:
         shutil.move(str(chunks_to_process[0][1]), str(final_output))
 
@@ -381,7 +398,7 @@ def process_video_web(video_path, mode, height, width, num_frames, fps, seed, au
         if should_split:
             chunk_out.unlink(missing_ok=True)
             
-    yield log_and_yield("Done!", "Video processing complete! Download the result below."), str(final_output)
+    yield emit("Done!", "Video processing complete! Download the result below.", str(final_output))
 
 
 # ─── Gradio UI Design ─────────────────────────────────────────────────────────
@@ -510,7 +527,7 @@ with gr.Blocks(theme=theme, css=css) as demo:
     btn_cancel.click(fn=None, inputs=None, outputs=None, cancels=[click_event])
 
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=8000, share=False)
+    demo.queue().launch(server_name="0.0.0.0", server_port=PORT, share=False)
 PYEOF
 
 ok "server.py written"
@@ -520,11 +537,18 @@ log "Starting FastAPI server on port $PORT..."
 cd "$REPO_DIR"
 
 # Kill existing server if running
-pkill -f "python server.py" 2>/dev/null || true
+if [ -f "$WORKSPACE/server.pid" ]; then
+    OLD_PID="$(cat "$WORKSPACE/server.pid" 2>/dev/null || true)"
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        log "Stopping existing server PID=$OLD_PID..."
+        kill "$OLD_PID" 2>/dev/null || true
+    fi
+fi
+pkill -f "python[0-9.]* server.py" 2>/dev/null || true
 pkill -f "uvicorn server:app" 2>/dev/null || true
 sleep 1
 
-nohup $PYTHON server.py > "$WORKSPACE/server.log" 2>&1 &
+PORT="$PORT" nohup "$PYTHON" server.py > "$WORKSPACE/server.log" 2>&1 &
 SERVER_PID=$!
 echo $SERVER_PID > "$WORKSPACE/server.pid"
 
